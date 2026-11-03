@@ -182,7 +182,7 @@ try:
     ordinary_ms = {}
     def ordinary_queries(version):
         for needle, token in [('return timeOut;', 'timeOut'), ('int number;', 'number'),
-                              ('int getNumber()', 'getNumber'), ('int ordinary(', 'ordinary'),
+                              ('int getNumber()', 'getNumber'), ('class Plain', 'Plain'), ('int ordinary(', 'ordinary'),
                               ('return local + number;', 'local'), ('int parameter)', 'parameter')]:
             line, text = next((i, text) for i, text in enumerate(source.splitlines()) if needle in text)
             col = text.index(needle) + needle.index(token)
@@ -219,6 +219,7 @@ try:
         'uri': metadata_only.as_uri(), 'languageId': 'java', 'version': 1, 'text': metadata_only.read_text()}}})
     metadata_line = metadata_only.read_text().splitlines()[1]
     assert 'metadata-only.delay' in names(query(None, metadata_only.as_uri(), 1, metadata_line.index('delay')))
+    assert 'metadata-only' in names(query(None, metadata_only.as_uri(), 1, metadata_line.index('MetadataOnly')))
     results = {}
     for key in ['app', 'vendor', 'app.time-out', 'app.enabled', 'app.nested.url', 'app.clients[0].url', 'app.routes.east.url', 'app.tags[0]', 'app.labels.region', 'app.labels[region.name]', 'constructor.remote-name', 'record.name', 'bean.url', 'app.backup', 'app.required', 'vendor.port', 'extra.url']:
         start = time.perf_counter()
@@ -230,6 +231,8 @@ try:
     library_line, library_text = next((i, text) for i, text in enumerate(attached.splitlines()) if 'int port' in text)
     library_uri = results['vendor.port']['response']['locations'][0]['uri']
     assert 'vendor.port' in names(query(None, library_uri, library_line, library_text.index('port')))
+    type_line, type_text = next((i, text) for i, text in enumerate(attached.splitlines()) if 'class LibrarySettings' in text)
+    assert 'vendor' in names(query(None, library_uri, type_line, type_text.index('LibrarySettings')))
     factory_line, factory_text = next((i, text) for i, text in enumerate(attached.splitlines()) if 'create(' in text)
     assert 'vendor.missing' in names(query(None, library_uri, factory_line, factory_text.index('create')))
     if spring_jar:

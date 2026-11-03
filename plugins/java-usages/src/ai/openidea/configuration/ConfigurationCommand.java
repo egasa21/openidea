@@ -539,7 +539,8 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 JsonObject group = value.getAsJsonObject();
                 String name = string(group, "name"), source = string(group, "sourceType");
                 if (source == null) source = string(group, "type");
-                if (name != null && source != null && (selected == null || selected instanceof IType))
+                if (name != null && source != null && (selected == null || selected instanceof IType type &&
+                        source.replace('$', '.').equals(type.getFullyQualifiedName('.'))))
                     add(name, project.findType(source.replace('$', '.'), monitor));
             }
             if (!metadata.has("properties")) return;
@@ -549,6 +550,8 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 JsonObject property = value.getAsJsonObject();
                 String key = string(property, "name"), source = string(property, "sourceType"), prefix = "";
                 if (key == null) continue;
+                if (selected instanceof IField && !canonical(key.substring(key.lastIndexOf('.') + 1)).equals(canonical(selected.getElementName()))) continue;
+                if (selected instanceof IType type && source != null && !source.replace('$', '.').equals(type.getFullyQualifiedName('.'))) continue;
                 JsonObject owner = null;
                 for (JsonElement groupValue : groups) {
                     JsonObject group = groupValue.getAsJsonObject();
@@ -560,6 +563,7 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 if (source == null && owner != null) source = string(owner, "type");
                 if (source == null && owner != null) source = string(owner, "sourceType");
                 if (source == null) continue;
+                if (selected instanceof IType type && !source.replace('$', '.').equals(type.getFullyQualifiedName('.'))) continue;
                 if (selected != null && !(selected instanceof IType)) {
                     String name = selected.getElementName();
                     if (selected instanceof IMethod && (name.startsWith("get") || name.startsWith("set"))) name = name.substring(3);

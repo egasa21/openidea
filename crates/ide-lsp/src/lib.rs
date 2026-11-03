@@ -1446,7 +1446,14 @@ impl LspManager {
                 )
                 .await
             {
-                Ok(Some(r)) => return Ok(Some(convert::document_symbols(&self.conv(t.enc()), &snap.path, r))),
+                Ok(Some(r)) => {
+                    let java_source = t.server.name == "jdtls"
+                        && snap.language.as_str() == "java"
+                        && snap.uri.as_str().starts_with("file:")
+                        && matches!(&r, lsp::DocumentSymbolResponse::Nested(_));
+                    let items = convert::document_symbols(&self.conv(t.enc()), &snap.path, r);
+                    return Ok(Some(if java_source { convert::java_source_symbols(&snap.text, items) } else { items }));
+                }
                 Ok(None) => out.value = Some(Some(Vec::new())),
                 Err(e) => out.fail(e),
             }

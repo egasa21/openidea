@@ -59,6 +59,7 @@ fn migrate_entries(data: &Path, local: &Path) {
         "java-usages-1.1.1.jar",
         "java-usages-1.2.0.jar",
         "java-usages-1.2.1.jar",
+        "java-usages-1.2.2.jar",
         "agents/registry.json",
     ]
     .into_iter()
@@ -302,6 +303,7 @@ mod tests {
             "java-usages-1.1.1.jar",
             "java-usages-1.2.0.jar",
             "java-usages-1.2.1.jar",
+            "java-usages-1.2.2.jar",
         ] {
             assert!(is_local(Path::new(entry)), "{entry}");
             assert_eq!(

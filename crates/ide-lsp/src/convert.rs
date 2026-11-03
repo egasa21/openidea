@@ -780,6 +780,27 @@ fn document_symbol(conv: &Conv, path: &Path, s: lsp::DocumentSymbol) -> OutlineI
     }
 }
 
+/// Lombok-generated members can share an annotation's range; querying that
+/// position searches an unrelated symbol (e.g. Object.toString) instead.
+pub fn java_source_symbols(text: &DocText, items: Vec<OutlineItem>) -> Vec<OutlineItem> {
+    let mut source = Vec::new();
+    for mut item in items {
+        item.children = java_source_symbols(text, item.children);
+        let range = item.selection_range;
+        let selected = text.as_str().get(text.byte_offset(range.start)..text.byte_offset(range.end));
+        let name = item.name.split(['(', '<']).next().unwrap_or(&item.name);
+        // Java permits Unicode escapes in identifiers; retain those source spellings.
+        if matches!(item.kind, SymbolKind::File | SymbolKind::Module | SymbolKind::Namespace | SymbolKind::Package)
+            || selected.is_some_and(|selected| selected == name || selected.contains("\\u"))
+        {
+            source.push(item);
+        } else {
+            source.extend(item.children);
+        }
+    }
+    source
+}
+
 /// Builds a tree from flat items sorted by (start asc, end desc) using range containment.
 fn nest(sorted: Vec<OutlineItem>) -> Vec<OutlineItem> {
     fn contains(outer: &Range, inner: &Range) -> bool {

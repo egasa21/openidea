@@ -57,7 +57,7 @@ is not a claim of full IntelliJ feature parity.
 ## Rebuild and delivery
 
 The checked-in jar is embedded by ide-sdk `include_bytes!`, installed as
-`java-usages-1.2.1.jar`, and added alongside existing initialization bundles.
+`java-usages-1.2.2.jar`, and added alongside existing initialization bundles.
 Users need no compiler, Maven or Python. Manifest/install version must change
 when replacing the bundle because OSGi caches bundles.
 
@@ -69,8 +69,10 @@ from its root (`sha256sum -c /path/to/build-dependencies.sha256`). Build twice
 and compare SHA-256. The prior 1.1.1 output was
 `1e569939cba22c7db6e2c9b53de2a4c10ccaabe762a51427119a04af3d974ae4`.
 Version 1.2.0 added the configuration command. Version 1.2.1 checks the selected
-Java expression/member before configuration indexing; its reproducible SHA-256 is
-`cc87992dba4d229b8536cd3d374ef5da82059e481c4f0b3e055bdb26cf7c260b`.
+Java expression/member before configuration indexing. Version 1.2.2 also filters
+metadata eligibility by qualified type name before resolving unrelated types;
+its reproducible SHA-256 is
+`835d47be4324460a67a2799ca3de5ce5712f9c30a50bd60559b84a391c23e7b1`.
 
 ```sh
 export PATH=/path/to/jdk25/bin:$PATH

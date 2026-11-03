@@ -2940,6 +2940,53 @@ async fn configuration_definition_uses_java_without_yaml_definition_capability()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn java_outline_excludes_generated_annotation_anchors_from_background_searches() {
+    let source = "@Builder\npublic record Sample(String value) { void run(int count) {} }\n";
+    let line = source.lines().nth(1).unwrap();
+    let range = |line: u32, start: usize, len: usize| {
+        json!({
+            "start": {"line": line, "character": start}, "end": {"line": line, "character": start + len}
+        })
+    };
+    let symbol = |name: &str, kind: u32, at: Value| {
+        json!({
+            "name": name, "kind": kind, "range": at, "selectionRange": at
+        })
+    };
+    let anchor = range(0, 0, 8);
+    let mut generated = symbol("SampleBuilder", 5, anchor.clone());
+    generated["children"] =
+        json!([symbol("value", 8, anchor.clone()), symbol("run(int)", 6, range(1, line.find("run").unwrap(), 3))]);
+    let mut record = symbol("Sample", 5, range(1, line.find("Sample").unwrap(), 6));
+    record["range"] = json!({"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}});
+    record["children"] = json!([
+        symbol("value", 8, range(1, line.find("value").unwrap(), 5)),
+        generated,
+        symbol("Sample(String)", 9, anchor)
+    ]);
+    for server in ["jdtls", "other-java"] {
+        let mut caps = incremental_caps();
+        caps["documentSymbolProvider"] = json!(true);
+        let h = harness_for("java", "java", &[(server, caps)], &[]);
+        let (doc, _) = h.open("Sample.java", source);
+        h.wait_status(server, ServerStatus::Ready).await;
+        h.launcher.state(server).respond("textDocument/documentSymbol", json!([record]));
+        let items = h.mgr.document_symbols(doc).await.unwrap().unwrap();
+        assert_eq!(items[0].name, "Sample");
+        let names: Vec<_> = items[0].children.iter().map(|item| item.name.as_str()).collect();
+        if server == "jdtls" {
+            assert_eq!(
+                names,
+                ["value", "run(int)"],
+                "retain source declarations, including children of generated wrappers"
+            );
+        } else {
+            assert_eq!(names, ["value", "SampleBuilder", "Sample(String)"], "other servers retain their outlines");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn configuration_usages_merge_native_and_unsaved_profiles_without_sibling_modules() {
     let mut caps = incremental_caps();
     caps["executeCommandProvider"] = json!({"commands": ["openidea.java.configuration"]});

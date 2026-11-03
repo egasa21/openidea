@@ -73,7 +73,7 @@ It does not build the project-wide configuration index.
 Find Usages resolves the selected Java element first. Locals and parameters skip the
 configuration index. Potential binding members are checked against JDT's indexed
 `@ConfigurationProperties` declarations, including nested/inherited members and factory
-return types. Metadata checks resolve only matching property names or factory methods,
+return types. Metadata checks resolve only matching qualified type names, property names or factory methods,
 rather than every metadata entry. Only a verified association starts the full index
 and merges configuration usages. At the source-candidate limit, the existing bounded
 index remains the conservative fallback. These eligibility checks still have a cost, especially
@@ -125,7 +125,7 @@ add 3,000 ordinary units and 100 binding classes; output includes cold/warm/edit
 latencies for the JDT command only, excluding server import, UI and configuration-file discovery. The optional actual Spring Boot JAR checks `server.port`,
 `spring.datasource.url` and `spring.jackson.date-format` through dependency
 metadata. No user's project is compiled or modified by the harness.
-Ordinary Java method, field, accessor, local and parameter probes run before the
+Ordinary Java type, method, field, accessor, local and parameter probes run before the
 configuration index is built and again after an edit. They must return no configuration
 keys, report zero indexed units, and retain native definitions/references. The harness
 also verifies binding declarations in another source unit and metadata-only source/library
