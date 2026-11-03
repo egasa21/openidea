@@ -57,7 +57,7 @@ is not a claim of full IntelliJ feature parity.
 ## Rebuild and delivery
 
 The checked-in jar is embedded by ide-sdk `include_bytes!`, installed as
-`java-usages-1.2.0.jar`, and added alongside existing initialization bundles.
+`java-usages-1.2.1.jar`, and added alongside existing initialization bundles.
 Users need no compiler, Maven or Python. Manifest/install version must change
 when replacing the bundle because OSGi caches bundles.
 
@@ -68,8 +68,9 @@ artifacts. Check the extracted distribution against `build-dependencies.sha256`
 from its root (`sha256sum -c /path/to/build-dependencies.sha256`). Build twice
 and compare SHA-256. The prior 1.1.1 output was
 `1e569939cba22c7db6e2c9b53de2a4c10ccaabe762a51427119a04af3d974ae4`.
-Version 1.2.0 adds the configuration command; its reproducible SHA-256 is
-`9140f1d2ecf27eadfe66b40a17daa18a08a65927ebef79456ba55d486ce5eeba`.
+Version 1.2.0 added the configuration command. Version 1.2.1 checks the selected
+Java expression/member before configuration indexing; its reproducible SHA-256 is
+`cc87992dba4d229b8536cd3d374ef5da82059e481c4f0b3e055bdb26cf7c260b`.
 
 ```sh
 export PATH=/path/to/jdk25/bin:$PATH
@@ -124,7 +125,7 @@ This is an app-owned JDT LS extension, not a standard LSP feature. It uses:
   reflects its private `getBuilderName(IField)` on the fingerprinted version.
 - `JavaLanguageServerPlugin.getPreferencesManager` and the returned preference
   objects (`isIncludeAccessors`).
-- `JDTUtils.resolveTypeRoot`, `findElementAtSelection`.
+- `JDTUtils.resolveTypeRoot`, `findElementAtSelection`, and `JsonRpcHelpers.toOffset`.
 - `org.eclipse.jdt.internal.corext.codemanipulation.GetterSetterUtil`.
 - Public JDT model/DOM APIs for exact target identity and source-expression context.
 

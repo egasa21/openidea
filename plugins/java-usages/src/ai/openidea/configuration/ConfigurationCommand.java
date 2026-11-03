@@ -12,6 +12,7 @@ import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.OperationCanceledException;
 import org.eclipse.jdt.core.*;
 import org.eclipse.jdt.core.dom.*;
+import org.eclipse.jdt.core.search.*;
 import org.eclipse.jdt.ls.core.internal.IDelegateCommandHandler;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
@@ -50,15 +51,33 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
         ITypeRoot selectedRoot = JDTUtils.resolveTypeRoot(uri);
         IJavaProject project = selectedRoot == null ? project(uri) : selectedRoot.getJavaProject();
         if (project == null) return Map.of("locations", List.of(), "keys", List.of(), "roots", List.of(), "incomplete", true);
+        IJavaElement selectedElement = key == null && selectedRoot != null ? JDTUtils.findElementAtSelection(selectedRoot, line, column,
+                JavaLanguageServerPlugin.getPreferencesManager(), monitor) : null;
+        String selected = selectedElement == null ? null : selectedElement.getHandleIdentifier();
+        if (key == null) {
+            Builder consumer = new Builder(monitor);
+            boolean constant = selectedElement == null || selectedElement instanceof IField field && field.getConstant() != null ||
+                    selectedElement instanceof ILocalVariable local && !local.isParameter() && Modifier.isFinal(local.getFlags());
+            if (constant && selectedRoot instanceof ICompilationUnit unit) {
+                String source = unit.getSource();
+                if (source != null && source.length() <= MAX_BYTES &&
+                        (source.contains("Value") || source.contains("getProperty") || source.contains("getRequiredProperty"))) {
+                    int offset = org.eclipse.jdt.ls.core.internal.handlers.JsonRpcHelpers.toOffset(unit.getBuffer(), line, column);
+                    if (offset >= 0) consumer.parse(unit, offset);
+                }
+            }
+            if (!references) {
+                Set<Map<String, Object>> keys = new LinkedHashSet<>();
+                for (Entry entry : consumer.entries) keys.add(Map.of("name", entry.name, "relaxed", entry.relaxed));
+                return Map.of("locations", List.of(), "keys", keys, "roots", keys.isEmpty() ? List.of() : roots(project),
+                        "incomplete", consumer.incomplete, "parsedUnits", 0);
+            }
+            if (consumer.entries.isEmpty() && !configurationMember(project, selected, monitor))
+                return Map.of("locations", List.of(), "keys", List.of(), "roots", List.of(), "incomplete", false, "parsedUnits", 0);
+        }
         Index index = index(project, monitor);
         Set<Map<String, Object>> keys = new LinkedHashSet<>();
         Set<Location> locations = new LinkedHashSet<>();
-        String selected = null;
-        if (key == null && selectedRoot != null && references) {
-            var element = JDTUtils.findElementAtSelection(selectedRoot, line, column,
-                    JavaLanguageServerPlugin.getPreferencesManager(), monitor);
-            if (element != null) selected = element.getHandleIdentifier();
-        }
         for (Entry entry : index.entries) {
             check(monitor);
             Location location = entry.location;
@@ -111,6 +130,64 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 "parsedUnits", index.parsed, "revision", index.revision);
     }
 
+    private static List<String> roots(IJavaProject project) throws JavaModelException {
+        Set<String> roots = new LinkedHashSet<>();
+        for (IPackageFragmentRoot root : project.getAllPackageFragmentRoots()) {
+            if (root.getKind() != IPackageFragmentRoot.K_SOURCE) continue;
+            if (root.getResource() != null && root.getResource().getLocationURI() != null)
+                roots.add(root.getResource().getLocationURI().toString());
+            if (root.getJavaProject().getProject().getLocationURI() != null)
+                roots.add(root.getJavaProject().getProject().getLocationURI().toString());
+        }
+        roots.add(project.getProject().getLocationURI().toString());
+        return List.copyOf(roots);
+    }
+
+    private static boolean configurationMember(IJavaProject project, String handle, IProgressMonitor monitor) throws Exception {
+        IJavaElement selected = handle == null ? null : JavaCore.create(handle);
+        if (!(selected instanceof IMember member) || Modifier.isStatic(member.getFlags()) && selected instanceof IField) return false;
+        // Discover binding declarations through JDT's annotation index, not a project-wide AST scan.
+        boolean property = selected instanceof IField || selected instanceof IType || selected instanceof IMethod method &&
+                (method.isConstructor() || method.getElementName().startsWith("get") || method.getElementName().startsWith("set") ||
+                Arrays.stream(method.getAnnotations()).anyMatch(a -> a.getElementName().endsWith("ConfigurationProperties")));
+        Builder candidates = new Builder(monitor, selected);
+        if (property) {
+            Set<ICompilationUnit> units = new LinkedHashSet<>();
+            var pattern = SearchPattern.createPattern(PROPERTIES, IJavaSearchConstants.ANNOTATION_TYPE,
+                    IJavaSearchConstants.ANNOTATION_TYPE_REFERENCE, SearchPattern.R_EXACT_MATCH | SearchPattern.R_CASE_SENSITIVE);
+            var owner = JavaLanguageServerPlugin.getInstance().getWorkingCopyOwner();
+            new SearchEngine(owner).search(pattern, new SearchParticipant[] {SearchEngine.getDefaultSearchParticipant()},
+                    SearchEngine.createJavaSearchScope(new IJavaElement[] {project}), new SearchRequestor() {
+                        @Override public void acceptSearchMatch(SearchMatch match) {
+                            check(monitor);
+                            if (units.size() < MAX_UNITS && match.getElement() instanceof IJavaElement element &&
+                                    element.getAncestor(IJavaElement.COMPILATION_UNIT) instanceof ICompilationUnit unit)
+                                units.add(unit);
+                        }
+                    }, monitor);
+            if (units.size() >= MAX_UNITS) return true;
+            for (ICompilationUnit unit : units) {
+                check(monitor);
+                String source = unit.getSource();
+                if (source == null || source.length() > MAX_BYTES) continue;
+                candidates.parse(unit);
+                if (candidates.entries.stream().anyMatch(entry -> entry.handle.equals(handle))) return true;
+                candidates.entries.clear();
+            }
+        }
+        // Metadata can associate an otherwise unannotated source or library member.
+        for (IPackageFragmentRoot root : project.getAllPackageFragmentRoots()) {
+            check(monitor);
+            if (root.getKind() == IPackageFragmentRoot.K_SOURCE && root.getResource() != null && root.getResource().getLocation() != null)
+                candidates.metadataDirectory(root.getResource().getLocation().toFile().toPath(), project);
+            else if (root.isArchive()) candidates.metadata(root, project);
+            if (candidates.entries.stream().anyMatch(entry -> entry.handle.equals(handle))) return true;
+            candidates.entries.clear();
+        }
+        candidates.metadataDirectory(project.getProject().getLocation().toFile().toPath().resolve("src/main/resources"), project);
+        return candidates.entries.stream().anyMatch(entry -> entry.handle.equals(handle));
+    }
+
     private static boolean sameUri(String a, String b) {
         URI left = URI.create(a), right = URI.create(b);
         if (left.equals(right)) return true;
@@ -122,6 +199,29 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
         var r = l.getRange();
         return (line > r.getStart().getLine() || line == r.getStart().getLine() && col >= r.getStart().getCharacter()) &&
                 (line < r.getEnd().getLine() || line == r.getEnd().getLine() && col < r.getEnd().getCharacter());
+    }
+    private static boolean contains(ASTNode node, int offset) {
+        return node.getStartPosition() <= offset && offset < node.getStartPosition() + node.getLength();
+    }
+    private static Expression valueExpression(Annotation node) {
+        if (node instanceof SingleMemberAnnotation single) return single.getValue();
+        if (node instanceof NormalAnnotation normal)
+            for (Object pair : normal.values())
+                if (pair instanceof MemberValuePair p && p.getName().getIdentifier().equals("value")) return p.getValue();
+        return null;
+    }
+    private static boolean consumerAt(CompilationUnit tree, int offset) {
+        for (ASTNode node = NodeFinder.perform(tree, offset, 0); node != null; node = node.getParent()) {
+            if (node instanceof Annotation annotation) {
+                String name = annotation.getTypeName().getFullyQualifiedName();
+                Expression value = valueExpression(annotation);
+                if ((name.equals("Value") || name.equals(VALUE)) && value != null && contains(value, offset)) return true;
+            }
+            if (node instanceof MethodInvocation call && !call.arguments().isEmpty() &&
+                    (call.getName().getIdentifier().equals("getProperty") || call.getName().getIdentifier().equals("getRequiredProperty")) &&
+                    contains((ASTNode) call.arguments().get(0), offset)) return true;
+        }
+        return false;
     }
     private static void check(IProgressMonitor monitor) { if (monitor.isCanceled()) throw new OperationCanceledException(); }
     private static IJavaProject project(String uri) {
@@ -174,15 +274,12 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
             if (valid) return cached;
         }
         Builder builder = new Builder(monitor);
-        Set<String> units = new HashSet<>(), roots = new LinkedHashSet<>();
+        Set<String> units = new HashSet<>();
+        List<String> roots = roots(project);
         int visited = 0;
         for (IPackageFragmentRoot root : project.getAllPackageFragmentRoots()) {
             check(monitor);
             if (root.getKind() == IPackageFragmentRoot.K_SOURCE) {
-                if (root.getResource() != null && root.getResource().getLocationURI() != null)
-                    roots.add(root.getResource().getLocationURI().toString());
-                if (root.getJavaProject().getProject().getLocationURI() != null)
-                    roots.add(root.getJavaProject().getProject().getLocationURI().toString());
                 if (root.getResource() != null && root.getResource().getLocation() != null)
                     builder.metadataDirectory(root.getResource().getLocation().toFile().toPath(), project);
                 for (IJavaElement child : root.getChildren()) {
@@ -207,7 +304,6 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
         }
         // Resource roots are not necessarily Java package roots (e.g. Maven resources).
         // Return project locations as well; the client excludes nested independent modules.
-        roots.add(project.getProject().getLocationURI().toString());
         builder.metadataDirectory(project.getProject().getLocation().toFile().toPath().resolve("src/main/resources"), project);
         Index result = new Index(revision, workingCopies, List.copyOf(builder.entries), List.copyOf(roots), Map.copyOf(builder.files), builder.incomplete, builder.parsed);
         CACHE.remove(id);
@@ -255,7 +351,9 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
         final Map<Path, FileStamp> files = new LinkedHashMap<>();
         boolean incomplete;
         int parsed;
-        Builder(IProgressMonitor monitor) { this.monitor = monitor; }
+        final IJavaElement selected;
+        Builder(IProgressMonitor monitor) { this(monitor, null); }
+        Builder(IProgressMonitor monitor, IJavaElement selected) { this.monitor = monitor; this.selected = selected; }
         void add(String key, IJavaElement element) {
             if (key.length() > 1024 || entries.size() >= MAX_ENTRIES) { incomplete = true; return; }
             if (element != null) entries.add(new Entry(key, element.getHandleIdentifier(), null, true));
@@ -266,13 +364,23 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
             try { entries.add(new Entry(key, "", JDTUtils.toLocation(unit, node.getStartPosition(), node.getLength()), false)); }
             catch (JavaModelException e) { incomplete = true; }
         }
-        void parse(ICompilationUnit unit) {
+        void parse(ICompilationUnit unit) throws JavaModelException {
+            parse(unit, -1);
+        }
+        void parse(ICompilationUnit unit, int offset) throws JavaModelException {
             check(monitor);
             ASTParser parser = ASTParser.newParser(AST.getJLSLatest());
+            if (offset >= 0) {
+                // Rule out ordinary selections without resolving any project bindings.
+                parser.setSource(unit.getSource().toCharArray());
+                parser.setCompilerOptions(unit.getJavaProject().getOptions(true));
+                if (!consumerAt((CompilationUnit) parser.createAST(monitor), offset)) return;
+            }
             parser.setSource(unit);
             parser.setResolveBindings(true);
             parser.setWorkingCopyOwner(JavaLanguageServerPlugin.getInstance().getWorkingCopyOwner());
             parser.setBindingsRecovery(false);
+            parser.setIgnoreMethodBodies(selected != null);
             CompilationUnit tree = (CompilationUnit) parser.createAST(monitor);
             parsed++;
             tree.accept(new ASTVisitor() {
@@ -281,10 +389,12 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 @Override public boolean visit(SingleMemberAnnotation node) { annotation(node); return true; }
                 @Override public boolean visit(MarkerAnnotation node) { annotation(node); return true; }
                 private void annotation(Annotation node) {
+                    if (offset >= 0 && !contains(node, offset)) return;
                     IAnnotationBinding binding = node.resolveAnnotationBinding();
                     if (binding == null) return;
                     String name = binding.getAnnotationType().getQualifiedName();
                     if (name.equals(PROPERTIES)) {
+                        if (offset >= 0) return;
                         String prefix = annotationValue(binding, "prefix");
                         if (prefix == null || prefix.isEmpty()) prefix = annotationValue(binding, "value");
                         if (prefix == null) prefix = "";
@@ -297,15 +407,13 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                         }
                     } else if (name.equals(VALUE)) {
                         String value = annotationValue(binding, "value");
-                        ASTNode expression = node;
-                        if (node instanceof SingleMemberAnnotation single) expression = single.getValue();
-                        else if (node instanceof NormalAnnotation normal) {
-                            for (Object pair : normal.values()) if (pair instanceof MemberValuePair p && p.getName().getIdentifier().equals("value")) expression = p.getValue();
-                        }
-                        if (value != null) placeholders(value, unit, expression);
+                        Expression expression = valueExpression(node);
+                        if (value != null && expression != null && (offset < 0 || contains(expression, offset)))
+                            placeholders(value, unit, expression);
                     }
                 }
                 @Override public boolean visit(MethodInvocation node) {
+                    if (offset >= 0 && (node.arguments().isEmpty() || !contains((ASTNode) node.arguments().get(0), offset))) return true;
                     IMethodBinding method = node.resolveMethodBinding();
                     if (method != null && (method.getName().equals("getProperty") || method.getName().equals("getRequiredProperty")) &&
                             subtype(method.getDeclaringClass(), RESOLVER, new HashSet<>()) && !node.arguments().isEmpty()) {
@@ -431,7 +539,8 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 JsonObject group = value.getAsJsonObject();
                 String name = string(group, "name"), source = string(group, "sourceType");
                 if (source == null) source = string(group, "type");
-                if (name != null && source != null) add(name, project.findType(source.replace('$', '.'), monitor));
+                if (name != null && source != null && (selected == null || selected instanceof IType))
+                    add(name, project.findType(source.replace('$', '.'), monitor));
             }
             if (!metadata.has("properties")) return;
             for (JsonElement value : metadata.getAsJsonArray("properties")) {
@@ -451,6 +560,14 @@ public final class ConfigurationCommand implements IDelegateCommandHandler {
                 if (source == null && owner != null) source = string(owner, "type");
                 if (source == null && owner != null) source = string(owner, "sourceType");
                 if (source == null) continue;
+                if (selected != null && !(selected instanceof IType)) {
+                    String name = selected.getElementName();
+                    if (selected instanceof IMethod && (name.startsWith("get") || name.startsWith("set"))) name = name.substring(3);
+                    String leaf = key.substring(key.lastIndexOf('.') + 1);
+                    String factory = owner == null ? null : string(owner, "sourceMethod");
+                    if (!canonical(leaf).equals(canonical(name)) &&
+                            !(selected instanceof IMethod && factory != null && factory.split("\\(", 2)[0].equals(selected.getElementName()))) continue;
+                }
                 IType type = project.findType(source.replace('$', '.'), monitor);
                 if (type == null) continue;
                 String leaf = key.substring(prefix.isEmpty() ? 0 : prefix.length() + 1);

@@ -70,8 +70,25 @@ class Consumers {
     @ConfigurationProperties("bean") Nested bean() { return new Nested(); }
 }
 class Fake { String getProperty(String name) { return name; } }
+class Plain {
+    int number;
+    int getNumber() { return number; }
+    int ordinary(int parameter) { int local = parameter; return local + number; }
+}
 '''
 file = write('demo/Settings.java', source)
+external = write('demo/External.java', '''package demo;
+class External { String endpoint; }
+''')
+metadata_only = write('demo/MetadataOnly.java', '''package demo;
+class MetadataOnly { int delay; }
+''')
+write('demo/Factory.java', '''package demo;
+class Factory {
+    @org.springframework.boot.context.properties.ConfigurationProperties("external")
+    External settings() { return new External(); }
+}
+''')
 if os.environ.get('OPENIDEA_CONFIGURATION_STRESS') == '1':
     for i in range(3000):
         write(f'noise/Plain{i}.java', f'package noise; class Plain{i} {{ int number; }}')
@@ -84,19 +101,22 @@ write('demo/NotSpring.java', '''package demo;
 local_metadata = project / 'src/main/resources/META-INF'
 local_metadata.mkdir(parents=True)
 (local_metadata / 'additional-spring-configuration-metadata.json').write_text(json.dumps({
-    'groups': [{'name': 'extra', 'sourceType': 'demo.Nested', 'type': 'demo.Nested'}],
-    'properties': [{'name': 'extra.url', 'sourceType': 'demo.Nested'}]
+    'groups': [{'name': 'extra', 'sourceType': 'demo.Nested', 'type': 'demo.Nested'},
+               {'name': 'metadata-only', 'sourceType': 'demo.MetadataOnly', 'type': 'demo.MetadataOnly'}],
+    'properties': [{'name': 'extra.url', 'sourceType': 'demo.Nested'},
+                   {'name': 'metadata-only.delay', 'sourceType': 'demo.MetadataOnly'}]
 }))
 # A dependency with metadata and attached source exercises actual library locations.
 libsource = work / 'libsrc/vendor/LibrarySettings.java'
 libsource.parent.mkdir(parents=True)
-libsource.write_text('package vendor; public class LibrarySettings { public int port; public int getPort() { return port; } }')
+libsource.write_text('package vendor; public class LibrarySettings { public int port; public int getPort() { return port; } public static LibrarySettings create() { return new LibrarySettings(); } }')
 classes = work / 'libclasses'
 classes.mkdir()
 subprocess.run(['javac', '--release', '21', '-d', str(classes), str(libsource)], check=True)
 library = work / 'library.jar'
-metadata = {'groups': [{'name': 'vendor', 'type': 'vendor.LibrarySettings', 'sourceType': 'vendor.LibrarySettings'}],
-            'properties': [{'name': 'vendor.port', 'type': 'java.lang.Integer', 'sourceType': 'vendor.LibrarySettings'}]}
+metadata = {'groups': [{'name': 'vendor', 'type': 'vendor.LibrarySettings', 'sourceType': 'vendor.LibrarySettings', 'sourceMethod': 'create()'}],
+            'properties': [{'name': 'vendor.port', 'type': 'java.lang.Integer', 'sourceType': 'vendor.LibrarySettings'},
+                           {'name': 'vendor.missing', 'type': 'java.lang.String'}]}
 with zipfile.ZipFile(library, 'w') as z:
     z.write(classes / 'vendor/LibrarySettings.class', 'vendor/LibrarySettings.class')
     z.writestr('META-INF/spring-configuration-metadata.json', json.dumps(metadata))
@@ -149,8 +169,8 @@ def request(method, params):
             if 'error' in msg: raise RuntimeError(msg['error'])
             return msg.get('result')
     raise TimeoutError(method)
-def query(key, uri=None, line=0, col=0):
-    return request('workspace/executeCommand', {'command': 'openidea.java.configuration', 'arguments': [uri or (project / 'application.yml').as_uri(), key, line, col, key is None, False]})
+def query(key, uri=None, line=0, col=0, references=None):
+    return request('workspace/executeCommand', {'command': 'openidea.java.configuration', 'arguments': [uri or (project / 'application.yml').as_uri(), key, line, col, key is None if references is None else references, False]})
 def names(result):
     return {p['name'] for p in result['keys']}
 try:
@@ -159,6 +179,46 @@ try:
     send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': file.as_uri(), 'languageId': 'java', 'version': 1, 'text': source}}})
     request('java/buildWorkspace', True)
     assert 'openidea.java.configuration' in init['capabilities']['executeCommandProvider']['commands'], init
+    ordinary_ms = {}
+    def ordinary_queries(version):
+        for needle, token in [('return timeOut;', 'timeOut'), ('int number;', 'number'),
+                              ('int getNumber()', 'getNumber'), ('int ordinary(', 'ordinary'),
+                              ('return local + number;', 'local'), ('int parameter)', 'parameter')]:
+            line, text = next((i, text) for i, text in enumerate(source.splitlines()) if needle in text)
+            col = text.index(needle) + needle.index(token)
+            modes = [False] if token == 'timeOut' else [False, True]
+            for references in modes:
+                start = time.perf_counter()
+                result = query(None, file.as_uri(), line, col, references)
+                ordinary_ms[f'{version}:{token}:{references}'] = (time.perf_counter() - start) * 1000
+                assert not result['keys'] and not result['locations'], (token, references, result)
+                assert result['parsedUnits'] == 0, ('ordinary selection built configuration index', result)
+                native = request('textDocument/references' if references else 'textDocument/definition', {
+                    'textDocument': {'uri': file.as_uri()}, 'position': {'line': line, 'character': col},
+                    **({'context': {'includeDeclaration': True}} if references else {})})
+                assert native, ('native Java result lost', token, references)
+    ordinary_queries('cold')
+    fake_line, fake_text = next((i, text) for i, text in enumerate(source.splitlines()) if 'String unrelated(Fake' in text)
+    fake = query(None, file.as_uri(), fake_line, fake_text.index('app.time-out'), False)
+    assert not fake['keys'] and fake['parsedUnits'] == 0, fake
+    # A placeholder/constant-key definition needs only the selected source, never the global index.
+    for needle, token, expected in [('"${app.time-out:30}"', 'app.time-out', 'app.time-out'),
+                                    ('env.getProperty(KEY)', 'KEY', 'app.time-out'),
+                                    ('"${app.missing:${app.backup:42}}"', 'app.backup', 'app.backup'),
+                                    ('env.getRequiredProperty("app.required")', 'app.required', 'app.required')]:
+        line, text = next((i, text) for i, text in enumerate(source.splitlines()) if needle in text)
+        result = query(None, file.as_uri(), line, text.index(needle) + needle.index(token), False)
+        assert expected in names(result), (needle, result)
+        assert result['parsedUnits'] == 0, result
+    # Binding association may live in a different unit; preserve its configuration usages.
+    send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {
+        'uri': external.as_uri(), 'languageId': 'java', 'version': 1, 'text': external.read_text()}}})
+    external_line = external.read_text().splitlines()[1]
+    assert 'external.endpoint' in names(query(None, external.as_uri(), 1, external_line.index('endpoint')))
+    send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {
+        'uri': metadata_only.as_uri(), 'languageId': 'java', 'version': 1, 'text': metadata_only.read_text()}}})
+    metadata_line = metadata_only.read_text().splitlines()[1]
+    assert 'metadata-only.delay' in names(query(None, metadata_only.as_uri(), 1, metadata_line.index('delay')))
     results = {}
     for key in ['app', 'vendor', 'app.time-out', 'app.enabled', 'app.nested.url', 'app.clients[0].url', 'app.routes.east.url', 'app.tags[0]', 'app.labels.region', 'app.labels[region.name]', 'constructor.remote-name', 'record.name', 'bean.url', 'app.backup', 'app.required', 'vendor.port', 'extra.url']:
         start = time.perf_counter()
@@ -167,6 +227,11 @@ try:
         assert result['locations'], (key, result)
     attached = request('java/classFileContents', {'uri': results['vendor.port']['response']['locations'][0]['uri']})
     assert attached and 'LibrarySettings' in attached and 'port' in attached, attached
+    library_line, library_text = next((i, text) for i, text in enumerate(attached.splitlines()) if 'int port' in text)
+    library_uri = results['vendor.port']['response']['locations'][0]['uri']
+    assert 'vendor.port' in names(query(None, library_uri, library_line, library_text.index('port')))
+    factory_line, factory_text = next((i, text) for i, text in enumerate(attached.splitlines()) if 'create(' in text)
+    assert 'vendor.missing' in names(query(None, library_uri, factory_line, factory_text.index('create')))
     if spring_jar:
         for key in ['server.port', 'spring.datasource.url', 'spring.jackson.date-format']:
             result = query(key)
@@ -192,9 +257,12 @@ try:
     # 3 binding targets + @Value + Environment constant; Fake.getProperty excluded.
     timeout = query('app.time-out')
     assert len(timeout['locations']) == 5, timeout
-    for needle, expected in [('int timeOut;', 'app.timeOut'), ('"${app.time-out:30}"', 'app.time-out'), ('env.getProperty(KEY)', 'app.time-out')]:
+    for needle, token, expected in [('int timeOut;', 'timeOut', 'app.timeOut'), ('"${app.time-out:30}"', 'app.time-out', 'app.time-out'),
+                                    ('env.getProperty(KEY)', 'KEY', 'app.time-out'), ('getTimeOut()', 'getTimeOut', 'app.timeOut'),
+                                    ('setTimeOut(', 'setTimeOut', 'app.timeOut'), ('boolean enabled;', 'enabled', 'app.enabled'),
+                                    ('String url;', 'url', 'app.nested.url'), ('String name, int count', 'name', 'record.name')]:
         line, text = next((i, s) for i, s in enumerate(source.splitlines()) if needle in s)
-        col = text.index(needle) + (4 if needle == 'int timeOut;' else (len('env.getProperty(') if needle.startswith('env.') else 4))
+        col = text.index(needle) + needle.index(token)
         reverse = query(None, file.as_uri(), line, col)
         assert expected in names(reverse), (needle, reverse)
     warm = []
@@ -203,6 +271,7 @@ try:
     # Unsaved changes must replace old keys, and closing must restore disk keys.
     changed = source.replace('prefix="app"', 'prefix="edited"').replace('${app.time-out:30}', '${edited.timeout:30}')
     send({'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {'textDocument': {'uri': file.as_uri(), 'version': 2}, 'contentChanges': [{'text': changed}]}})
+    ordinary_queries('after-edit')
     edit_start = time.perf_counter()
     updated = query('edited.time-out')
     edit_ms = (time.perf_counter() - edit_start) * 1000
@@ -211,7 +280,7 @@ try:
     send({'jsonrpc': '2.0', 'method': 'textDocument/didClose', 'params': {'textDocument': {'uri': file.as_uri()}}})
     restored = query('app.nested.url')
     assert restored['locations'], restored
-    evidence = {'stress': os.environ.get('OPENIDEA_CONFIGURATION_STRESS') == '1', 'editRebuildMs': edit_ms, 'cases': results, 'warmMedianMs': sorted(warm)[len(warm)//2] * 1000, 'warmMaxMs': max(warm) * 1000}
+    evidence = {'stress': os.environ.get('OPENIDEA_CONFIGURATION_STRESS') == '1', 'ordinaryJavaMs': ordinary_ms, 'editRebuildMs': edit_ms, 'cases': results, 'warmMedianMs': sorted(warm)[len(warm)//2] * 1000, 'warmMaxMs': max(warm) * 1000}
     (work / 'evidence.json').write_text(json.dumps(evidence, indent=2))
     print(json.dumps(evidence, indent=2))
 finally:
